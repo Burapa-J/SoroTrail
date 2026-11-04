@@ -103,6 +103,9 @@ func ReconcileReorgRange(ctx context.Context, st Store, opts ReorgReconcileOptio
 	if opts.FromLedger <= 0 || opts.ToLedger <= 0 || opts.FromLedger > opts.ToLedger {
 		return ReorgReconcileResult{}, fmt.Errorf("invalid reorg ledger range [%d,%d]", opts.FromLedger, opts.ToLedger)
 	}
+	if _, attributed := ResolveQueryOrigin(ctx); !attributed {
+		ctx = WithJobOrigin(ctx, "reconciler")
+	}
 	network := defaultNetwork(opts.Network)
 	res := ReorgReconcileResult{
 		FromLedger: opts.FromLedger,

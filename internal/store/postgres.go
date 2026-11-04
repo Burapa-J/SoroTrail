@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -2216,6 +2217,25 @@ func nullableString(s string) any {
 	return s
 }
 
+// attributedTx wraps a pgx.Tx so every SQL statement executed inside a
+// guarded transaction carries SoroTrail's bounded cost-attribution comment tag
+// (/*sorotrail:origin=...,op=...,tenant=...*/) when ctx carries an origin (#1278).
+type attributedTx struct {
+	pgx.Tx
+}
+
+func (t attributedTx) Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
+	return t.Tx.Exec(ctx, TagSQLWithOrigin(ctx, "", sql), arguments...)
+}
+
+func (t attributedTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return t.Tx.Query(ctx, TagSQLWithOrigin(ctx, "", sql), args...)
+}
+
+func (t attributedTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return t.Tx.QueryRow(ctx, TagSQLWithOrigin(ctx, "", sql), args...)
+}
+
 func (p *Postgres) withStatementTimeoutTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -2231,7 +2251,7 @@ func (p *Postgres) withStatementTimeoutTx(ctx context.Context, fn func(pgx.Tx) e
 			return fmt.Errorf("setting statement_timeout: %w", err)
 		}
 	}
-	if err := fn(tx); err != nil {
+	if err := fn(attributedTx{Tx: tx}); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {

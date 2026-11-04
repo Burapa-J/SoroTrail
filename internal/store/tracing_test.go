@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -13,6 +17,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/tracing/tracingtest"
 )
 
@@ -483,4 +488,212 @@ func TestNewTracingStoreWithoutTracer(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), inserted)
 	assert.Equal(t, []string{"UpsertEvents"}, fake.calls)
+}
+
+func TestTracingStoreCostAttribution_RequestAndTenant(t *testing.T) {
+	exp := tracingtest.Setup(t)
+	ledger := NewCostAttributionLedger(16, 16)
+	fake := &tracingFakeStore{
+		events: []Event{{ID: "event-1"}, {ID: "event-2"}, {ID: "event-3"}},
+		cursor: "next-cursor",
+	}
+	ts := NewTracingStore(fake, otel.Tracer("test")).(*TracingStore).WithCostLedger(ledger)
+
+	const contractID = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+	ctx := WithRouteOrigin(
+		context.Background(),
+		"GET",
+		"/contracts/"+contractID+"/events?limit=50&cursor=secret",
+		42,
+		false,
+		nil,
+	)
+
+	beforeQueries := testutil.ToFloat64(DBAttributedQueriesTotal.WithLabelValues(
+		"GET /contracts/{id}/events", OriginKindRoute, "t_42", "store.QueryEvents", "success",
+	))
+	beforeRows := testutil.ToFloat64(DBAttributedRowsTotal.WithLabelValues(
+		"GET /contracts/{id}/events", OriginKindRoute, "t_42", "store.QueryEvents",
+	))
+
+	events, cursor, err := ts.QueryEvents(ctx, EventFilter{ContractID: contractID})
+	require.NoError(t, err)
+	assert.Len(t, events, 3)
+	assert.Equal(t, "next-cursor", cursor)
+
+	span := onlySpan(t, exp)
+	attrs := spanAttrs(span)
+	assert.Equal(t, "GET /contracts/{id}/events", attrs["store.origin"])
+	assert.Equal(t, OriginKindRoute, attrs["store.origin_kind"])
+	assert.Equal(t, "t_42", attrs["store.tenant"])
+
+	assert.Equal(t, beforeQueries+1, testutil.ToFloat64(DBAttributedQueriesTotal.WithLabelValues(
+		"GET /contracts/{id}/events", OriginKindRoute, "t_42", "store.QueryEvents", "success",
+	)))
+	assert.Equal(t, beforeRows+3, testutil.ToFloat64(DBAttributedRowsTotal.WithLabelValues(
+		"GET /contracts/{id}/events", OriginKindRoute, "t_42", "store.QueryEvents",
+	)))
+
+	originSummary, ok := ledger.OriginCost("GET /contracts/{id}/events")
+	require.True(t, ok)
+	assert.Equal(t, uint64(1), originSummary.Queries)
+	assert.Equal(t, uint64(3), originSummary.RowsProcessed)
+
+	tenantSummary, ok := ledger.TenantCost("t_42")
+	require.True(t, ok)
+	assert.Equal(t, uint64(1), tenantSummary.Queries)
+	assert.Equal(t, uint64(3), tenantSummary.RowsProcessed)
+
+	tagged := TagSQLWithOrigin(ctx, "store.QueryEvents", "SELECT id FROM events WHERE contract_id = $1")
+	assert.Equal(t,
+		"SELECT id FROM events WHERE contract_id = $1 /*sorotrail:origin=GET /contracts/{id}/events,op=store.QueryEvents,tenant=t_42*/",
+		tagged,
+	)
+	assert.NotContains(t, tagged, contractID, "SQL tag must never contain a contract identifier")
+}
+
+func TestTracingStoreCostAttribution_BackgroundJobs(t *testing.T) {
+	jobs := []struct {
+		name string
+		ctx  context.Context
+	}{
+		{"ingester", requestid.WithJob(context.Background(), requestid.JobIngester)},
+		{"pruner", requestid.WithJob(context.Background(), requestid.JobPruner)},
+		{"archiver", WithJobOrigin(context.Background(), requestid.JobArchiver)},
+		{"reconciler", WithJobOrigin(context.Background(), requestid.JobReconciler)},
+		{"auditor", requestid.WithJob(context.Background(), requestid.JobAuditor)},
+		{"webhook", requestid.WithJob(context.Background(), requestid.JobWebhook)},
+	}
+
+	for _, jb := range jobs {
+		t.Run(jb.name, func(t *testing.T) {
+			exp := tracingtest.Setup(t)
+			ledger := NewCostAttributionLedger(16, 16)
+			fake := &tracingFakeStore{upsertInserted: 5}
+			ts := NewTracingStore(fake, otel.Tracer("test")).(*TracingStore).WithCostLedger(ledger)
+
+			_, err := ts.UpsertEvents(jb.ctx, []Event{{ID: "ev-1"}, {ID: "ev-2"}})
+			require.NoError(t, err)
+
+			span := onlySpan(t, exp)
+			attrs := spanAttrs(span)
+			assert.Equal(t, jb.name, attrs["store.origin"])
+			assert.Equal(t, OriginKindJob, attrs["store.origin_kind"])
+			assert.Equal(t, SystemTenantBucket, attrs["store.tenant"])
+
+			oc, ok := ledger.OriginCost(jb.name)
+			require.True(t, ok)
+			assert.Equal(t, uint64(1), oc.Queries)
+			assert.Equal(t, uint64(2), oc.RowsProcessed)
+
+			tc, ok := ledger.TenantCost(SystemTenantBucket)
+			require.True(t, ok)
+			assert.Equal(t, uint64(1), tc.Queries)
+
+			sqlTag := FormatSQLCommentTag(jb.ctx, "store.UpsertEvents")
+			assert.Equal(t,
+				fmt.Sprintf("/*sorotrail:origin=%s,op=store.UpsertEvents,tenant=system*/", jb.name),
+				sqlTag,
+			)
+		})
+	}
+}
+
+func TestCostAttribution_NoSensitiveValueInTagOrLabel(t *testing.T) {
+	const (
+		contractID = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+		accountID  = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+		apiKey     = "st_ABCDEFGHIJKLMNOP_SECRETTOKENVALUE123456"
+		txHash     = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		tenantName = "acme-corp-private-tenant-name"
+	)
+
+	assert.True(t, ContainsSensitiveIdentifier(contractID))
+	assert.True(t, ContainsSensitiveIdentifier(accountID))
+	assert.True(t, ContainsSensitiveIdentifier(apiKey))
+	assert.True(t, ContainsSensitiveIdentifier(txHash))
+
+	// Attempting to smuggle sensitive identifiers into origin or tenant fields
+	// must scrub them to bounded placeholders.
+	ctx := WithQueryOrigin(context.Background(), QueryOrigin{
+		Kind:     OriginKindRoute,
+		Origin:   "GET /addresses/" + accountID + "/events?api_key=" + apiKey + "&tx=" + txHash,
+		TenantID: tenantName + "-" + contractID,
+	})
+
+	resolved, ok := ResolveQueryOrigin(ctx)
+	require.True(t, ok)
+	assert.Equal(t, "GET /addresses/{address}/events", resolved.Origin)
+	assert.Equal(t, RedactedTenantBucket, resolved.TenantID)
+
+	tag := FormatSQLCommentTag(ctx, "store.QueryEvents")
+	for _, secret := range []string{contractID, accountID, apiKey, txHash, tenantName} {
+		assert.NotContains(t, tag, secret, "SQL statement tag must never contain sensitive value %q", secret)
+	}
+}
+
+func TestCostAttribution_BoundedCardinalityCap(t *testing.T) {
+	ledger := NewCostAttributionLedger(4, 4)
+	fake := &tracingFakeStore{events: []Event{{ID: "e-1"}}}
+	ts := NewTracingStore(fake, nil).(*TracingStore).WithCostLedger(ledger)
+
+	for i := int64(1); i <= 15; i++ {
+		ctx := WithRouteOrigin(context.Background(), "GET", "/events", i, false, nil)
+		_, _, err := ts.QueryEvents(ctx, EventFilter{})
+		require.NoError(t, err)
+	}
+
+	snap := ledger.Snapshot()
+	assert.LessOrEqual(t, len(snap.ByTenant), 5, "tenant series count must remain bounded by MaxTenantSeries + overflow bucket")
+	assert.Greater(t, snap.TenantOverflowEvents, uint64(0), "excess tenants must fold into t_other")
+
+	overflowSummary, ok := ledger.TenantCost(OverflowTenantBucket)
+	require.True(t, ok)
+	assert.Greater(t, overflowSummary.Queries, uint64(0))
+}
+
+func TestGuardedStore_SlowQueryLogIncludesAttribution(t *testing.T) {
+	var buf strings.Builder
+	guarded := NewGuardedStore(&testGuardedStore{}, GuardedStoreOptions{
+		Timeout:            20 * time.Millisecond,
+		SlowQueryThreshold: time.Nanosecond,
+		Logger:             slog.New(slog.NewTextHandler(&buf, nil)),
+	})
+
+	ctx := WithRouteOrigin(context.Background(), "GET", "/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/events", 7, false, nil)
+	_, _, err := guarded.QueryEvents(ctx, EventFilter{})
+	require.Error(t, err)
+
+	logOut := buf.String()
+	assert.Contains(t, logOut, "slow store query")
+	assert.Contains(t, logOut, "GET /contracts/{id}/events")
+	assert.Contains(t, logOut, "tenant_id=t_7")
+	assert.Contains(t, logOut, "/*sorotrail:origin=GET /contracts/{id}/events,op=store.QueryEvents,tenant=t_7*/")
+	assert.NotContains(t, logOut, "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC")
+}
+
+func BenchmarkQueryCostAttributionOverhead(b *testing.B) {
+	fake := &tracingFakeStore{
+		events: []Event{{ID: "event-1"}, {ID: "event-2"}},
+		cursor: "c-2",
+	}
+	ts := NewTracingStore(fake, nil).(*TracingStore)
+	ctx := WithRouteOrigin(context.Background(), "GET", "/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/events", 42, false, nil)
+	filter := EventFilter{ContractID: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"}
+
+	b.Run("UnattributedBaseline", func(b *testing.B) {
+		bg := context.Background()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, _, _ = fake.QueryEvents(bg, filter)
+		}
+	})
+
+	b.Run("AttributedTracingAndSQLTag", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, _, _ = ts.QueryEvents(ctx, filter)
+			_ = TagSQLWithOrigin(ctx, "store.QueryEvents", "SELECT id FROM events WHERE contract_id = $1")
+		}
+	})
 }

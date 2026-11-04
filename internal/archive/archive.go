@@ -314,6 +314,7 @@ func (a *Archiver) ArchiveRange(ctx context.Context, fromLedger, toLedger int64)
 	if a == nil {
 		return "", "", nil
 	}
+	ctx = store.WithJobOrigin(ctx, "archiver")
 	if a.lagController != nil {
 		if yield, reason := a.lagController.ShouldYield("archiver"); yield {
 			a.lagYields.Add(1)

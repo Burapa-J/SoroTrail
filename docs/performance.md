@@ -389,4 +389,52 @@ When a non-ingester subsystem exhausts either its own cap (`reason="subsystem_ca
 | `sorotrail_db_pool_maintenance_yields_total` | CounterVec | `job`, `reason` | Total times background maintenance yielded due to pool pressure |
 | `sorotrail_db_pool_connections` | GaugeVec | `state` | Live connection counts (`acquired`, `idle`, `total`, `max`, `ingester_reserved`, `shared_cap`) |
 
+---
+
+## 8. Database Query Cost Attribution & Statement Tagging
+
+Every database operation executed through SoroTrail's store layer is attributed to the HTTP route pattern, GraphQL operation, or background job that triggered it, and—when a tenant context is present—to an opaque tenant bucket (`internal/store/tracing.go`, #1278).
+
+### A. Propagation & Origin Normalization (`store.QueryOrigin`)
+
+1. **HTTP & GraphQL Requests (`store.WithRouteOrigin`)**:
+   - The HTTP server middleware (`internal/api/server.go`) attaches a lazy route resolver that inspects `chi.RouteContext(r.Context()).RoutePattern()` after routing completes and normalizes the path via `store.NormalizeRouteOrigin` against the closed set of canonical route templates (e.g. `GET /events`, `GET /contracts/{id}/events`, `POST /graphql`).
+   - Unmatched or probed paths collapse to `METHOD /unmatched` (or `"unmatched"`), ensuring path-parameter fuzzing or arbitrary 404 probes can never create new metric series.
+   - Once `authenticate` (`internal/api/auth.go`) resolves an authenticated tenant (`auth.Tenant.ID`), it updates the context with an opaque tenant identifier (`t_<id>`, e.g. `t_42`) while public/unauthenticated calls use `"public"`.
+2. **Background Jobs (`store.WithJobOrigin` & `requestid.IsKnownJob`)**:
+   - Background loops attach their canonical job identifier (`ingester`, `pruner`, `archiver`, `reconciler`, `auditor`, `webhook`) with `origin_kind="job"` and `tenant="system"`.
+   - `store.ResolveQueryOrigin` also recognizes `requestid.FromContext(ctx)` job prefixes and `store.SubsystemIngester` pool budget contexts so every background store call is attributed without requiring manual caller plumbing.
+
+### B. SQL Comment Tagging (`pg_stat_statements` & `pg_stat_activity`)
+
+`store.FormatSQLCommentTag` and `store.TagSQLWithOrigin` prepend a deterministic leading SQL comment to statements executed inside guarded Postgres transactions (`attributedTx` in `internal/store/postgres.go`):
+
+```sql
+/*sorotrail:origin=GET_/events,kind=route,op=QueryEvents,tenant=t_42*/ SELECT ...
+```
+
+- **Strict Sensitive-Value Scrubbing (`store.ContainsSensitiveIdentifier`)**: Before emitting any SQL comment tag, metric label, or span attribute, SoroTrail rejects raw Stellar contract/account strkeys (`C...`/`G...`, 56-char base32), API key secrets (`st_...`, `sorotrail_...`), and 64-character hex tokens/hashes, replacing them with bounded safe placeholders (`unmatched`, `t_redacted`).
+- **Cardinality Ceiling (`store.DefaultMaxOriginCostSeries = 64`, `store.DefaultMaxTenantCostSeries = 64`)**: `store.CostAttributionLedger` caps distinct origin and tenant keys at 64 each, folding any overflow into `"unattributed"` / `"t_other"`.
+
+### C. Cost Attribution Metrics & Slow-Query Logs
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `sorotrail_db_attributed_queries_total` | CounterVec | `origin`, `origin_kind`, `op`, `tenant` | Total database queries executed, attributed by origin, operation, and opaque tenant |
+| `sorotrail_db_attributed_query_duration_seconds` | HistogramVec | `origin`, `origin_kind`, `op`, `tenant` | Database query execution time in seconds, attributed by origin, operation, and opaque tenant |
+| `sorotrail_db_attributed_rows_total` | CounterVec | `origin`, `origin_kind`, `op`, `tenant` | Total rows read or affected, attributed by origin, operation, and opaque tenant |
+| `sorotrail_db_attributed_slow_queries_total` | CounterVec | `origin`, `origin_kind`, `op`, `tenant` | Total queries exceeding `DB_SLOW_QUERY_THRESHOLD`, attributed by origin, operation, and opaque tenant |
+
+When a store operation exceeds `DB_SLOW_QUERY_THRESHOLD` (`internal/store/guarded_store.go`), the `"slow store query"` warning log automatically includes `origin`, `origin_kind`, `tenant_id`, and `sql_tag` alongside `query`, `duration`, and `threshold`.
+
+### D. Attribution Overhead Benchmark (`BenchmarkQueryCostAttributionOverhead`)
+
+Measured via `go test -bench=BenchmarkQueryCostAttributionOverhead -benchmem ./internal/store` on Apple M4 (`darwin/arm64`):
+
+| Path | Latency (`ns/op`) | Share of `0.85 ms` DB Query | Bytes / Op (`B/op`) | Allocs / Op |
+|---|---:|---:|---:|---:|
+| `UnattributedBaseline` (direct store call) | `45.70 ns/op` | `0.005%` | `83 B/op` | `0 allocs/op` |
+| `AttributedTracingAndSQLTag` (OTel span + ledger + Prometheus + SQL tag) | `1,374 ns/op` (`1.37 µs`) | **`0.16%`** | `1,064 B/op` | `29 allocs/op` |
+
+
 

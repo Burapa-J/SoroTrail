@@ -478,6 +478,9 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			KeyID:     key.ID,
 			KeyPrefix: prefix,
 		})
+		ctx = store.WithRouteOrigin(ctx, r.Method, r.URL.Path, tenant.ID, false, func() string {
+			return r.Method + " " + s.routePattern(r)
+		})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

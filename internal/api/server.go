@@ -879,10 +879,14 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 		reqID := middleware.GetReqID(r.Context())
 		log := s.log.With(requestid.Field, reqID, "route", r.Method+" "+r.URL.Path)
 		ctx := context.WithValue(r.Context(), loggerCtxKey, log)
-		// Mirror the id onto the context so layers below the router — the
-		// store and RPC decorators in particular — can tag their own slow-
-		// query and error logs without the handler passing it along.
+		// Mirror the id and route origin onto the context so layers below the
+		// router — the store and RPC decorators in particular — can tag their
+		// own slow-query logs, statement comments, and cost metrics without
+		// the handler passing them along (#1278).
 		ctx = requestid.WithRequestID(ctx, reqID)
+		ctx = store.WithRouteOrigin(ctx, r.Method, r.URL.Path, 0, true, func() string {
+			return r.Method + " " + s.routePattern(r)
+		})
 		ww.Header().Set("X-Request-ID", reqID)
 		next.ServeHTTP(ww, r.WithContext(ctx))
 		if span := trace.SpanFromContext(r.Context()); span.IsRecording() {

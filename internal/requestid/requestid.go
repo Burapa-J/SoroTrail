@@ -24,11 +24,24 @@ const Field = "request_id"
 // what lets an operator correlate a worker's own log lines with the store
 // and RPC activity it drove.
 const (
-	JobIngester = "ingester"
-	JobPruner   = "pruner"
-	JobAuditor  = "auditor"
-	JobWebhook  = "webhook"
+	JobIngester   = "ingester"
+	JobPruner     = "pruner"
+	JobArchiver   = "archiver"
+	JobReconciler = "reconciler"
+	JobAuditor    = "auditor"
+	JobWebhook    = "webhook"
 )
+
+// IsKnownJob reports whether id is one of the canonical background worker
+// job identifiers (ingester, pruner, archiver, reconciler, auditor, webhook).
+func IsKnownJob(id string) bool {
+	switch id {
+	case JobIngester, JobPruner, JobArchiver, JobReconciler, JobAuditor, JobWebhook:
+		return true
+	default:
+		return false
+	}
+}
 
 // ctxKey is the context key type for the request id. It is unexported so no
 // other package can collide with the entry.

@@ -62,10 +62,13 @@ func (s *guardedStore) logSlowQuery(ctx context.Context, name string, start time
 	if duration < s.options.SlowQueryThreshold {
 		return
 	}
-	// The correlation id travels on the context, so a slow query is tagged
-	// with the HTTP request or background job that caused it without the
-	// store interface growing a parameter for it.
+	DefaultCostLedger().RecordSlowQuery(ctx, name)
+	// The correlation id and bounded origin/tenant attribution travel on the
+	// context, so a slow query is tagged with the HTTP route or background
+	// job and opaque tenant that caused it without the store interface growing
+	// a parameter for it.
 	attrs := requestid.Attrs(ctx)
+	attrs = append(attrs, AttributionLogAttrs(ctx, name)...)
 	attrs = append(attrs,
 		"query", name,
 		"duration", duration,

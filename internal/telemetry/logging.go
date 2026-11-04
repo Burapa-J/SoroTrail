@@ -28,6 +28,24 @@ const (
 
 	// FieldTxHash is the canonical key for transaction hashes.
 	FieldTxHash = "tx_hash"
+
+	// FieldOrigin is the canonical key for the bounded query originator
+	// (an HTTP route pattern such as "GET /events" or a background job id
+	// such as "ingester", "pruner", "archiver", "reconciler", "auditor", "webhook").
+	FieldOrigin = "origin"
+
+	// FieldOriginKind is the canonical key for the originator class ("route" | "job" | "unattributed").
+	FieldOriginKind = "origin_kind"
+
+	// FieldTenantID is the canonical key for the opaque tenant identifier
+	// ("system", "untenanted", "t_<id>", or "t_other").
+	FieldTenantID = "tenant_id"
+
+	// FieldQueryOp is the canonical key for the store operation name (e.g. "store.QueryEvents").
+	FieldQueryOp = "query_op"
+
+	// FieldSQLTag is the canonical key for the normalized SQL comment tag attached to a statement.
+	FieldSQLTag = "sql_tag"
 )
 
 // SanitizeURL removes basic-auth credentials from a URL string so that secrets
@@ -79,4 +97,19 @@ func WithError(err error) slog.Attr {
 		return slog.String(FieldError, "")
 	}
 	return slog.String(FieldError, err.Error())
+}
+
+// WithOrigin returns a slog.Attr for the canonical origin field.
+func WithOrigin(origin string) slog.Attr {
+	return slog.String(FieldOrigin, origin)
+}
+
+// WithTenantID returns a slog.Attr for the canonical opaque tenant_id field.
+func WithTenantID(tenantID string) slog.Attr {
+	return slog.String(FieldTenantID, tenantID)
+}
+
+// WithSQLTag returns a slog.Attr for the canonical sql_tag field.
+func WithSQLTag(tag string) slog.Attr {
+	return slog.String(FieldSQLTag, tag)
 }
